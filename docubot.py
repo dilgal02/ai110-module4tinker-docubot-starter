@@ -9,6 +9,20 @@ Core DocuBot class responsible for:
 
 import os
 import glob
+import re
+
+# Filler words that appear in every doc and would otherwise drown out
+# the meaningful query words during scoring
+STOPWORDS = {
+    "a", "an", "the", "is", "are", "do", "does", "i", "to", "of", "in", "on",
+    "for", "and", "or", "what", "which", "where", "how", "there", "any",
+    "these", "this", "it", "be", "by", "with", "from", "all",
+}
+
+# A section must contain at least this many query word hits to count as evidence.
+# Off-topic questions (payments, OAuth, rate limits) score at most 2 on these docs,
+# usually from a single common word like "api" or "users".
+MIN_EVIDENCE_SCORE = 3
 
 class DocuBot:
     def __init__(self, docs_folder="docs", llm_client=None):
@@ -22,8 +36,11 @@ class DocuBot:
         # Load documents into memory
         self.documents = self.load_documents()  # List of (filename, text)
 
+        # Split documents into heading sections so retrieval returns focused snippets
+        self.sections = self.split_into_sections(self.documents)  # List of (filename, section_text)
+
         # Build a retrieval index (implemented in Phase 1)
-        self.index = self.build_index(self.documents)
+        self.index = self.build_index(self.sections)
 
     # -----------------------------------------------------------
     # Document Loading
@@ -44,27 +61,47 @@ class DocuBot:
                 docs.append((filename, text))
         return docs
 
+    def split_into_sections(self, documents):
+        """
+        Splits each document at its markdown headings (#, ##, ### ...).
+        A section is a heading plus everything under it up to the next heading.
+        Returns a list of tuples: (filename, section_text)
+        """
+        sections = []
+        for filename, text in documents:
+            for section in re.split(r"\n(?=#{1,6} )", text):
+                section = section.strip()
+                if section:
+                    sections.append((filename, section))
+        return sections
+
     # -----------------------------------------------------------
     # Index Construction (Phase 1)
     # -----------------------------------------------------------
 
-    def build_index(self, documents):
+    def tokenize(self, text):
         """
-        TODO (Phase 1):
-        Build a tiny inverted index mapping lowercase words to the documents
-        they appear in.
+        Lowercases text and splits it into words, dropping punctuation and stopwords.
+        Underscores also split, so "auth_utils.py" yields "auth", "utils", "py".
+        """
+        words = re.findall(r"[a-z0-9]+", text.lower())
+        return [word for word in words if word not in STOPWORDS]
+
+    def build_index(self, sections):
+        """
+        Build a tiny inverted index mapping lowercase words to the sections
+        they appear in, stored as positions in the sections list.
 
         Example structure:
         {
-            "token": ["AUTH.md", "API_REFERENCE.md"],
-            "database": ["DATABASE.md"]
+            "token": [3, 4, 12],
+            "database": [20, 21]
         }
-
-        Keep this simple: split on whitespace, lowercase tokens,
-        ignore punctuation if needed.
         """
         index = {}
-        # TODO: implement simple indexing
+        for i, (_, text) in enumerate(sections):
+            for word in set(self.tokenize(text)):
+                index.setdefault(word, []).append(i)
         return index
 
     # -----------------------------------------------------------
@@ -73,27 +110,36 @@ class DocuBot:
 
     def score_document(self, query, text):
         """
-        TODO (Phase 1):
-        Return a simple relevance score for how well the text matches the query.
-
-        Suggested baseline:
-        - Convert query into lowercase words
-        - Count how many appear in the text
-        - Return the count as the score
+        Return a simple relevance score for how well the text matches the query:
+        the total number of times the query words appear in the text.
         """
-        # TODO: implement scoring
-        return 0
+        text_words = self.tokenize(text)
+        query_words = set(self.tokenize(query))
+        return sum(text_words.count(word) for word in query_words)
 
     def retrieve(self, query, top_k=3):
         """
-        TODO (Phase 1):
-        Use the index and scoring function to select top_k relevant document snippets.
+        Use the index and scoring function to select the top_k most relevant sections.
 
-        Return a list of (filename, text) sorted by score descending.
+        Return a list of (filename, section_text) sorted by score descending.
+        Sections scoring below MIN_EVIDENCE_SCORE are dropped, so an empty
+        list means the docs hold no useful context for this query.
         """
+        # Only score sections that contain at least one query word
+        candidates = set()
+        for word in self.tokenize(query):
+            candidates.update(self.index.get(word, []))
+
         results = []
-        # TODO: implement retrieval logic
-        return results[:top_k]
+        for i in sorted(candidates):
+            filename, text = self.sections[i]
+            score = self.score_document(query, text)
+            has_enough_evidence = score >= MIN_EVIDENCE_SCORE
+            if has_enough_evidence:
+                results.append((score, filename, text))
+
+        results.sort(key=lambda r: r[0], reverse=True)
+        return [(filename, text) for _, filename, text in results][:top_k]
 
     # -----------------------------------------------------------
     # Answering Modes
@@ -106,6 +152,7 @@ class DocuBot:
         """
         snippets = self.retrieve(query, top_k=top_k)
 
+        # No section met MIN_EVIDENCE_SCORE, so refuse instead of showing weak matches
         if not snippets:
             return "I do not know based on these docs."
 
@@ -128,6 +175,7 @@ class DocuBot:
 
         snippets = self.retrieve(query, top_k=top_k)
 
+        # No section met MIN_EVIDENCE_SCORE, so refuse without calling the LLM
         if not snippets:
             return "I do not know based on these docs."
 
